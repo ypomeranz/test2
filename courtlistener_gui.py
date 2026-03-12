@@ -308,7 +308,14 @@ class CourtListenerGUI:
 
         def run() -> None:
             try:
+                print(f"\n[download] raw item keys: {list(item.keys())}")
+                print(f"[download] local_path   = {item.get('local_path') or item.get('localPath')!r}")
+                print(f"[download] download_url = {item.get('download_url')!r}")
+                print(f"[download] cluster_id   = {item.get('cluster_id') or item.get('id')!r}")
+
                 pdf_url = self._resolve_pdf_url(client, item)
+                print(f"[download] resolved url = {pdf_url!r}")
+
                 if not pdf_url:
                     self.root.after(
                         0,
@@ -319,7 +326,9 @@ class CourtListenerGUI:
                     return
 
                 self.root.after(0, self._status_var.set, f"Downloading… {pdf_url}")
+                print(f"[download] fetching {pdf_url}")
                 response = client._session.get(pdf_url, timeout=60, stream=True)
+                print(f"[download] HTTP {response.status_code}  content-type: {response.headers.get('content-type')}")
                 response.raise_for_status()
 
                 with open(save_path, "wb") as f:
