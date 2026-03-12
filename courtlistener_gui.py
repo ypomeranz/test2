@@ -44,6 +44,9 @@ class CourtListenerGUI:
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=28)
+
         # --- Token row ---
         token_frame = ttk.LabelFrame(self.root, text="API Token", padding=6)
         token_frame.pack(fill="x", padx=10, pady=(10, 4))
