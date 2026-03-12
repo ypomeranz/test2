@@ -338,17 +338,25 @@ class CourtListenerGUI:
         Attempt to find a PDF URL for the selected search result.
 
         Strategy:
-        1. Use download_url from the search result if it points to a PDF.
-        2. Fetch the cluster's sub_opinions and check each opinion for
-           download_url or local_path.
-        3. Fall back to any download_url regardless of extension.
+        1. Use local_path from the search result (stored on CourtListener's servers).
+        2. Use download_url from the search result (original source — may not be .pdf).
+        3. Fetch the cluster's sub_opinions and check each opinion for
+           local_path or download_url.
         """
-        # 1. Direct PDF link on the search result
-        url = item.get("download_url", "")
-        if url and url.lower().endswith(".pdf"):
+        storage_base = "https://storage.courtlistener.com/"
+
+        # 1. local_path on the search result (most reliable — CourtListener's own copy)
+        local = item.get("local_path") or item.get("localPath") or ""
+        if local:
+            return storage_base + local.lstrip("/")
+
+        # 2. download_url on the search result (original court source)
+        #    Note: court URLs often don't end in ".pdf" even when they are PDFs.
+        url = item.get("download_url") or ""
+        if url:
             return url
 
-        # 2. Fetch cluster → sub_opinions → opinion detail
+        # 3. Fetch cluster → sub_opinions → opinion detail
         cluster_id = item.get("cluster_id") or item.get("id")
         if cluster_id:
             try:
@@ -359,17 +367,16 @@ class CourtListenerGUI:
                     op = client._get_url(
                         op_url, {"fields": "download_url,local_path"}
                     )
-                    dl = op.get("download_url", "")
-                    if dl and dl.lower().endswith(".pdf"):
-                        return dl
-                    local = op.get("local_path", "")
+                    local = op.get("local_path") or ""
                     if local:
-                        return f"https://storage.courtlistener.com/{local}"
+                        return storage_base + local.lstrip("/")
+                    dl = op.get("download_url") or ""
+                    if dl:
+                        return dl
             except Exception:
                 pass
 
-        # 3. Any download_url as a last resort
-        return item.get("download_url") or None
+        return None
 
     def _restore_buttons(self) -> None:
         self._download_btn.config(state="normal")
