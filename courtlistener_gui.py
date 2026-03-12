@@ -1,0 +1,402 @@
+"""
+CourtListener GUI
+=================
+A Tkinter interface for searching US case law via the CourtListener API
+and downloading opinion PDFs.
+
+Requires:
+    pip install requests
+
+Usage:
+    python courtlistener_gui.py
+
+Set the COURTLISTENER_TOKEN environment variable to pre-fill the token field.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from typing import Optional
+
+from courtlistener import COURTS, CourtListenerClient, CourtListenerError
+
+
+class CourtListenerGUI:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("CourtListener Case Law Search")
+        self.root.geometry("1050x680")
+        self.root.minsize(800, 500)
+
+        self._client: Optional[CourtListenerClient] = None
+        self._results: list[dict] = []
+        self._search_thread: Optional[threading.Thread] = None
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        # --- Token row ---
+        token_frame = ttk.LabelFrame(self.root, text="API Token", padding=6)
+        token_frame.pack(fill="x", padx=10, pady=(10, 4))
+
+        self._token_var = tk.StringVar(value=os.environ.get("COURTLISTENER_TOKEN", ""))
+        ttk.Label(token_frame, text="Token:").pack(side="left")
+        self._token_entry = ttk.Entry(
+            token_frame, textvariable=self._token_var, show="*", width=55
+        )
+        self._token_entry.pack(side="left", padx=6)
+        self._show_token_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            token_frame,
+            text="Show",
+            variable=self._show_token_var,
+            command=self._toggle_token_vis,
+        ).pack(side="left")
+
+        # --- Search frame ---
+        search_frame = ttk.LabelFrame(self.root, text="Search", padding=6)
+        search_frame.pack(fill="x", padx=10, pady=4)
+
+        # Row 1: query + button
+        row1 = ttk.Frame(search_frame)
+        row1.pack(fill="x", pady=(0, 4))
+        ttk.Label(row1, text="Query:").pack(side="left")
+        self._query_var = tk.StringVar()
+        self._query_entry = ttk.Entry(row1, textvariable=self._query_var)
+        self._query_entry.pack(side="left", padx=6, fill="x", expand=True)
+        self._query_entry.bind("<Return>", lambda _e: self._do_search())
+        self._search_btn = ttk.Button(row1, text="Search", command=self._do_search)
+        self._search_btn.pack(side="left", padx=(0, 4))
+
+        # Row 2: filters
+        row2 = ttk.Frame(search_frame)
+        row2.pack(fill="x")
+
+        ttk.Label(row2, text="Court:").pack(side="left")
+        self._court_var = tk.StringVar(value="(any)")
+        court_choices = ["(any)"] + sorted(COURTS.keys())
+        ttk.Combobox(
+            row2,
+            textvariable=self._court_var,
+            values=court_choices,
+            width=10,
+            state="readonly",
+        ).pack(side="left", padx=(4, 12))
+
+        ttk.Label(row2, text="Filed from:").pack(side="left")
+        self._date_from_var = tk.StringVar()
+        ttk.Entry(row2, textvariable=self._date_from_var, width=12).pack(
+            side="left", padx=4
+        )
+
+        ttk.Label(row2, text="to:").pack(side="left")
+        self._date_to_var = tk.StringVar()
+        ttk.Entry(row2, textvariable=self._date_to_var, width=12).pack(
+            side="left", padx=4
+        )
+
+        ttk.Label(row2, text="  Max results:").pack(side="left")
+        self._page_size_var = tk.IntVar(value=20)
+        ttk.Spinbox(
+            row2, from_=5, to=20, textvariable=self._page_size_var, width=5
+        ).pack(side="left", padx=4)
+
+        # --- Results table ---
+        results_frame = ttk.LabelFrame(self.root, text="Results", padding=6)
+        results_frame.pack(fill="both", expand=True, padx=10, pady=4)
+
+        cols = ("case_name", "court", "date_filed", "citation", "status")
+        self._tree = ttk.Treeview(
+            results_frame, columns=cols, show="headings", selectmode="browse"
+        )
+        self._tree.heading("case_name", text="Case Name")
+        self._tree.heading("court", text="Court")
+        self._tree.heading("date_filed", text="Date Filed")
+        self._tree.heading("citation", text="Citation")
+        self._tree.heading("status", text="Status")
+
+        self._tree.column("case_name", width=390, minwidth=200)
+        self._tree.column("court", width=75, minwidth=60, anchor="center")
+        self._tree.column("date_filed", width=90, minwidth=80, anchor="center")
+        self._tree.column("citation", width=160, minwidth=100)
+        self._tree.column("status", width=120, minwidth=80)
+
+        vsb = ttk.Scrollbar(results_frame, orient="vertical", command=self._tree.yview)
+        self._tree.configure(yscrollcommand=vsb.set)
+        self._tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self._tree.bind("<Double-1>", lambda _e: self._download_selected())
+        self._tree.bind("<<TreeviewSelect>>", self._on_row_select)
+
+        # --- Status bar + download button ---
+        bottom = ttk.Frame(self.root)
+        bottom.pack(fill="x", padx=10, pady=(2, 10))
+
+        self._download_btn = ttk.Button(
+            bottom,
+            text="Download PDF",
+            command=self._download_selected,
+            state="disabled",
+        )
+        self._download_btn.pack(side="right", padx=4)
+
+        self._status_var = tk.StringVar(value="Enter a query and click Search.")
+        ttk.Label(bottom, textvariable=self._status_var, anchor="w").pack(
+            side="left", fill="x", expand=True
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _toggle_token_vis(self) -> None:
+        self._token_entry.config(show="" if self._show_token_var.get() else "*")
+
+    def _on_row_select(self, _event=None) -> None:
+        if self._tree.selection():
+            self._download_btn.config(state="normal")
+
+    def _get_client(self) -> Optional[CourtListenerClient]:
+        token = self._token_var.get().strip()
+        if not token:
+            messagebox.showerror(
+                "Missing Token", "Please enter your CourtListener API token."
+            )
+            return None
+        if self._client is None or self._client._session.headers.get(
+            "Authorization"
+        ) != f"Token {token}":
+            self._client = CourtListenerClient(api_token=token)
+        return self._client
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def _do_search(self) -> None:
+        if self._search_thread and self._search_thread.is_alive():
+            return
+
+        client = self._get_client()
+        if client is None:
+            return
+
+        query = self._query_var.get().strip()
+        if not query:
+            messagebox.showwarning("Empty Query", "Please enter a search query.")
+            return
+
+        court = self._court_var.get()
+        if court == "(any)":
+            court = None
+        date_from = self._date_from_var.get().strip() or None
+        date_to = self._date_to_var.get().strip() or None
+        page_size = self._page_size_var.get()
+
+        # Clear previous results
+        self._search_btn.config(state="disabled")
+        self._download_btn.config(state="disabled")
+        self._status_var.set("Searching…")
+        for row in self._tree.get_children():
+            self._tree.delete(row)
+        self._results.clear()
+
+        def run() -> None:
+            try:
+                data = client.search(
+                    query,
+                    type="o",
+                    court=court,
+                    date_filed_min=date_from,
+                    date_filed_max=date_to,
+                    page_size=page_size,
+                )
+                self.root.after(0, self._on_results, data)
+            except CourtListenerError as exc:
+                self.root.after(0, self._on_error, str(exc))
+            except Exception as exc:
+                self.root.after(0, self._on_error, f"Unexpected error: {exc}")
+
+        self._search_thread = threading.Thread(target=run, daemon=True)
+        self._search_thread.start()
+
+    def _on_results(self, data: dict) -> None:
+        self._search_btn.config(state="normal")
+        results = data.get("results", [])
+        count = data.get("count", len(results))
+        self._results = results
+
+        for i, item in enumerate(results):
+            case_name = item.get("caseName") or item.get("case_name") or "(unknown)"
+            court = item.get("court") or item.get("court_id") or ""
+            date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+            citations = item.get("citation", [])
+            if isinstance(citations, list):
+                citation_str = citations[0] if citations else ""
+            else:
+                citation_str = str(citations) if citations else ""
+            status = (
+                item.get("precedentialStatus") or item.get("precedential_status") or ""
+            )
+            self._tree.insert(
+                "",
+                "end",
+                iid=str(i),
+                values=(case_name, court, date_filed, citation_str, status),
+            )
+
+        if results:
+            self._status_var.set(
+                f"Showing {len(results)} of {count:,} results. "
+                "Select a row and click Download PDF (or double-click)."
+            )
+        else:
+            self._status_var.set("No results found.")
+
+    def _on_error(self, message: str) -> None:
+        self._search_btn.config(state="normal")
+        self._status_var.set(f"Error: {message}")
+        messagebox.showerror("API Error", message)
+
+    # ------------------------------------------------------------------
+    # Download
+    # ------------------------------------------------------------------
+
+    def _download_selected(self) -> None:
+        selection = self._tree.selection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Please select a case first.")
+            return
+
+        idx = int(selection[0])
+        item = self._results[idx]
+
+        case_name = item.get("caseName") or item.get("case_name") or "opinion"
+        safe_name = "".join(
+            c if c.isalnum() or c in " -_" else "_" for c in case_name
+        )[:80].strip()
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            initialfile=f"{safe_name}.pdf",
+            title="Save Opinion PDF",
+        )
+        if not save_path:
+            return
+
+        client = self._get_client()
+        if client is None:
+            return
+
+        self._status_var.set("Resolving PDF URL…")
+        self._download_btn.config(state="disabled")
+        self._search_btn.config(state="disabled")
+
+        def run() -> None:
+            try:
+                pdf_url = self._resolve_pdf_url(client, item)
+                if not pdf_url:
+                    self.root.after(
+                        0,
+                        self._on_error,
+                        "No downloadable PDF found for this opinion.\n\n"
+                        "The source document may only be available as HTML.",
+                    )
+                    return
+
+                self.root.after(0, self._status_var.set, f"Downloading… {pdf_url}")
+                response = client._session.get(pdf_url, timeout=60, stream=True)
+                response.raise_for_status()
+
+                with open(save_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+
+                self.root.after(0, self._on_download_done, save_path)
+            except Exception as exc:
+                self.root.after(0, self._on_error, f"Download failed: {exc}")
+            finally:
+                self.root.after(0, self._restore_buttons)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _resolve_pdf_url(
+        self, client: CourtListenerClient, item: dict
+    ) -> Optional[str]:
+        """
+        Attempt to find a PDF URL for the selected search result.
+
+        Strategy:
+        1. Use download_url from the search result if it points to a PDF.
+        2. Fetch the cluster's sub_opinions and check each opinion for
+           download_url or local_path.
+        3. Fall back to any download_url regardless of extension.
+        """
+        # 1. Direct PDF link on the search result
+        url = item.get("download_url", "")
+        if url and url.lower().endswith(".pdf"):
+            return url
+
+        # 2. Fetch cluster → sub_opinions → opinion detail
+        cluster_id = item.get("cluster_id") or item.get("id")
+        if cluster_id:
+            try:
+                cluster = client.get_cluster(
+                    int(cluster_id), fields="sub_opinions"
+                )
+                for op_url in cluster.get("sub_opinions", []):
+                    op = client._get_url(
+                        op_url, {"fields": "download_url,local_path"}
+                    )
+                    dl = op.get("download_url", "")
+                    if dl and dl.lower().endswith(".pdf"):
+                        return dl
+                    local = op.get("local_path", "")
+                    if local:
+                        return f"https://storage.courtlistener.com/{local}"
+            except Exception:
+                pass
+
+        # 3. Any download_url as a last resort
+        return item.get("download_url") or None
+
+    def _restore_buttons(self) -> None:
+        self._download_btn.config(state="normal")
+        self._search_btn.config(state="normal")
+
+    def _on_download_done(self, path: str) -> None:
+        self._status_var.set(f"Saved: {path}")
+        if messagebox.askyesno(
+            "Download Complete", f"PDF saved to:\n{path}\n\nOpen it now?"
+        ):
+            self._open_file(path)
+
+    @staticmethod
+    def _open_file(path: str) -> None:
+        if sys.platform == "win32":
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+
+
+def main() -> None:
+    root = tk.Tk()
+    CourtListenerGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
