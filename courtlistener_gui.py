@@ -10,20 +10,44 @@ Requires:
 Usage:
     python courtlistener_gui.py
 
-Set the COURTLISTENER_TOKEN environment variable to pre-fill the token field.
+Token lookup order:
+  1. COURTLISTENER_TOKEN environment variable
+  2. ~/.config/courtlistener/config.json  (saved automatically after first use)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from courtlistener import COURTS, CourtListenerClient, CourtListenerError
+
+_CONFIG_PATH = Path.home() / ".config" / "courtlistener" / "config.json"
+
+
+def _load_saved_token() -> str:
+    """Return the token saved in the config file, or '' if none."""
+    try:
+        data = json.loads(_CONFIG_PATH.read_text())
+        return data.get("api_token", "")
+    except Exception:
+        return ""
+
+
+def _save_token(token: str) -> None:
+    """Persist *token* to the config file."""
+    try:
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CONFIG_PATH.write_text(json.dumps({"api_token": token}))
+    except Exception:
+        pass  # Non-fatal – token simply won't persist
 
 try:
     from google_scholar import GoogleScholarFetcher
@@ -59,7 +83,8 @@ class CourtListenerGUI:
         token_frame = ttk.LabelFrame(self.root, text="API Token", padding=6)
         token_frame.pack(fill="x", padx=10, pady=(10, 4))
 
-        self._token_var = tk.StringVar(value=os.environ.get("COURTLISTENER_TOKEN", ""))
+        initial_token = os.environ.get("COURTLISTENER_TOKEN") or _load_saved_token()
+        self._token_var = tk.StringVar(value=initial_token)
         ttk.Label(token_frame, text="Token:").pack(side="left")
         self._token_entry = ttk.Entry(
             token_frame, textvariable=self._token_var, show="*", width=55
@@ -198,6 +223,7 @@ class CourtListenerGUI:
             "Authorization"
         ) != f"Token {token}":
             self._client = CourtListenerClient(api_token=token)
+            _save_token(token)
         return self._client
 
     # ------------------------------------------------------------------
