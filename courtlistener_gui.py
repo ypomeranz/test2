@@ -475,14 +475,21 @@ class CourtListenerGUI:
         client: CourtListenerClient,
         gen: int,
     ) -> None:
-        """Background thread: fetch plain text, compute word count, schedule UI update."""
+        """Background thread: fetch opinion text, compute word count, schedule UI update."""
         with self._fetch_sema:
             if gen != self._fetch_gen:
                 return
             try:
-                op = client.get_opinion(opinion_id, fields="plain_text")
-                text = op.get("plain_text") or ""
-                text = re.sub(r"<[^>]+>", "", text).strip()
+                op = client.get_opinion(
+                    opinion_id, fields="html_with_citations,html,plain_text"
+                )
+                raw = (
+                    op.get("html_with_citations")
+                    or op.get("html")
+                    or op.get("plain_text")
+                    or ""
+                )
+                text = re.sub(r"<[^>]+>", "", raw).strip()
             except Exception:
                 text = ""
             if gen != self._fetch_gen:
