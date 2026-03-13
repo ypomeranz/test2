@@ -25,6 +25,13 @@ from typing import Optional
 
 from courtlistener import COURTS, CourtListenerClient, CourtListenerError
 
+try:
+    from google_scholar import GoogleScholarFetcher
+
+    _SCHOLAR_AVAILABLE = True
+except ImportError:
+    _SCHOLAR_AVAILABLE = False
+
 
 class CourtListenerGUI:
     def __init__(self, root: tk.Tk) -> None:
@@ -36,6 +43,7 @@ class CourtListenerGUI:
         self._client: Optional[CourtListenerClient] = None
         self._results: list[dict] = []
         self._search_thread: Optional[threading.Thread] = None
+        self._scholar: Optional["GoogleScholarFetcher"] = None
 
         self._build_ui()
 
@@ -153,6 +161,15 @@ class CourtListenerGUI:
         )
         self._download_btn.pack(side="right", padx=4)
 
+        scholar_tip = "" if _SCHOLAR_AVAILABLE else " (needs beautifulsoup4)"
+        self._scholar_btn = ttk.Button(
+            bottom,
+            text=f"Scholar Text{scholar_tip}",
+            command=self._fetch_scholar_text,
+            state="disabled",
+        )
+        self._scholar_btn.pack(side="right", padx=4)
+
         self._status_var = tk.StringVar(value="Enter a query and click Search.")
         ttk.Label(bottom, textvariable=self._status_var, anchor="w").pack(
             side="left", fill="x", expand=True
@@ -168,6 +185,7 @@ class CourtListenerGUI:
     def _on_row_select(self, _event=None) -> None:
         if self._tree.selection():
             self._download_btn.config(state="normal")
+            self._scholar_btn.config(state="normal")
 
     def _get_client(self) -> Optional[CourtListenerClient]:
         token = self._token_var.get().strip()
@@ -209,6 +227,7 @@ class CourtListenerGUI:
         # Clear previous results
         self._search_btn.config(state="disabled")
         self._download_btn.config(state="disabled")
+        self._scholar_btn.config(state="disabled")
         self._status_var.set("Searching…")
         for row in self._tree.get_children():
             self._tree.delete(row)
@@ -304,6 +323,7 @@ class CourtListenerGUI:
 
         self._status_var.set("Resolving PDF URL…")
         self._download_btn.config(state="disabled")
+        self._scholar_btn.config(state="disabled")
         self._search_btn.config(state="disabled")
 
         def run() -> None:
@@ -390,8 +410,125 @@ class CourtListenerGUI:
 
         return None
 
+    # ------------------------------------------------------------------
+    # Google Scholar text fetch
+    # ------------------------------------------------------------------
+
+    def _get_scholar(self) -> Optional["GoogleScholarFetcher"]:
+        if not _SCHOLAR_AVAILABLE:
+            messagebox.showerror(
+                "Missing Dependency",
+                "Google Scholar fetching requires beautifulsoup4.\n\n"
+                "Install it with:\n    pip install beautifulsoup4",
+            )
+            return None
+        if self._scholar is None:
+            self._scholar = GoogleScholarFetcher()
+        return self._scholar
+
+    def _fetch_scholar_text(self) -> None:
+        selection = self._tree.selection()
+        if not selection:
+            messagebox.showinfo("No Selection", "Please select a case first.")
+            return
+
+        fetcher = self._get_scholar()
+        if fetcher is None:
+            return
+
+        idx = int(selection[0])
+        item = self._results[idx]
+
+        citations = item.get("citation", [])
+        citation_str = citations[0] if isinstance(citations, list) and citations else ""
+        case_name = item.get("caseName") or item.get("case_name") or ""
+        date_filed = item.get("dateFiled") or item.get("date_filed") or ""
+        year = date_filed[:4] if date_filed else None
+
+        self._download_btn.config(state="disabled")
+        self._scholar_btn.config(state="disabled")
+        self._search_btn.config(state="disabled")
+        self._status_var.set("Searching Google Scholar…")
+
+        def run() -> None:
+            result = None
+            if citation_str:
+                print(f"[scholar] trying citation: {citation_str!r}")
+                result = fetcher.fetch_by_citation(citation_str)
+            if result is None and case_name:
+                print(f"[scholar] falling back to case name: {case_name!r} ({year})")
+                result = fetcher.fetch_by_name(case_name, year)
+
+            self.root.after(0, self._on_scholar_result, result)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_scholar_result(self, result: Optional[tuple[str, str]]) -> None:
+        self._restore_buttons()
+        if result is None:
+            self._status_var.set("Google Scholar: no text found.")
+            messagebox.showwarning(
+                "Scholar Not Found",
+                "Could not find this opinion on Google Scholar.\n\n"
+                "Google may have blocked the request, or the case may not be indexed.\n"
+                "Check the terminal for details.",
+            )
+            return
+
+        url, text = result
+        self._status_var.set(f"Scholar text loaded from {url}")
+        self._show_scholar_window(url, text)
+
+    def _show_scholar_window(self, url: str, text: str) -> None:
+        win = tk.Toplevel(self.root)
+        win.title("Google Scholar Opinion Text")
+        win.geometry("800x600")
+
+        # URL bar
+        url_frame = ttk.Frame(win)
+        url_frame.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(url_frame, text="Source:").pack(side="left")
+        url_var = tk.StringVar(value=url)
+        ttk.Entry(url_frame, textvariable=url_var, state="readonly").pack(
+            side="left", fill="x", expand=True, padx=4
+        )
+
+        # Text area
+        text_frame = ttk.Frame(win)
+        text_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        txt = tk.Text(text_frame, wrap="word", font=("TkDefaultFont", 10))
+        vsb = ttk.Scrollbar(text_frame, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.config(state="disabled")
+
+        # Save button
+        def save_text() -> None:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                title="Save Opinion Text",
+                parent=win,
+            )
+            if path:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                messagebox.showinfo("Saved", f"Text saved to:\n{path}", parent=win)
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btn_frame, text="Save as .txt…", command=save_text).pack(side="right")
+        ttk.Label(
+            btn_frame,
+            text=f"{len(text):,} characters  |  cached locally",
+            foreground="gray",
+        ).pack(side="left")
+
     def _restore_buttons(self) -> None:
         self._download_btn.config(state="normal")
+        self._scholar_btn.config(state="normal")
         self._search_btn.config(state="normal")
 
     def _on_download_done(self, path: str) -> None:
