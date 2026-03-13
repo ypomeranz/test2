@@ -290,7 +290,8 @@ class CourtListenerGUI:
             date_filed = item.get("dateFiled") or item.get("date_filed") or ""
             citations = item.get("citation", [])
             if isinstance(citations, list):
-                citation_str = citations[0] if citations else ""
+                us_reports = next((c for c in citations if " U.S. " in c), None)
+                citation_str = us_reports or (citations[0] if citations else "")
             else:
                 citation_str = str(citations) if citations else ""
             status = (
