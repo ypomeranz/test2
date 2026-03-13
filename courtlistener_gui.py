@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -48,6 +49,38 @@ def _save_token(token: str) -> None:
         _CONFIG_PATH.write_text(json.dumps({"api_token": token}))
     except Exception:
         pass  # Non-fatal – token simply won't persist
+
+
+# LOC tile server hosts per-opinion PDFs for US Reports volumes 1-570 (~through 2012).
+# GovInfo link service covers volumes up to ~585 (~through 2017) and redirects to the
+# official opinion PDF.  Volumes 586+ fall back to the CourtListener copy.
+_LOC_MAX_VOL = 570
+_GOVINFO_MAX_VOL = 585
+_US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
+
+
+def _us_reports_pdf_url(citation: str) -> Optional[str]:
+    """
+    Return the official US Reports PDF URL for a citation like '410 U.S. 113'.
+
+    Priority:
+        vols 1-570   → LOC tile server (per-opinion PDF, exact document)
+        vols 571-585 → GovInfo link service (redirects to per-opinion PDF)
+        vols 586+    → None  (fall back to CourtListener copy)
+    """
+    m = _US_CITE_RE.search(citation)
+    if not m:
+        return None
+    vol, page = int(m.group(1)), int(m.group(2))
+    if vol <= _LOC_MAX_VOL:
+        return (
+            f"https://tile.loc.gov/storage-services/service/ll/usrep/"
+            f"usrep{vol:03d}/usrep{vol:03d}{page}/usrep{vol:03d}{page}.pdf"
+        )
+    if vol <= _GOVINFO_MAX_VOL:
+        return f"https://www.govinfo.gov/link/usreports/{vol}/{page}"
+    return None
+
 
 try:
     from google_scholar import GoogleScholarFetcher
@@ -397,12 +430,25 @@ class CourtListenerGUI:
         Attempt to find a PDF URL for the selected search result.
 
         Strategy:
+        0. If a US Reports citation is present, use the official LOC/GovInfo PDF.
         1. Use local_path from the search result (stored on CourtListener's servers).
         2. Use download_url from the search result (original source — may not be .pdf).
         3. Fetch the cluster's sub_opinions and check each opinion for
            local_path or download_url.
         """
         storage_base = "https://storage.courtlistener.com/"
+
+        # 0. Official US Reports PDF (LOC or GovInfo) — highest fidelity source
+        citations = item.get("citation", [])
+        if isinstance(citations, list):
+            us_cite = next((c for c in citations if " U.S. " in c), None)
+        else:
+            us_cite = str(citations) if citations and " U.S. " in str(citations) else None
+        if us_cite:
+            official_url = _us_reports_pdf_url(us_cite)
+            if official_url:
+                print(f"[resolve] using official US Reports PDF: {official_url}")
+                return official_url
 
         # 1. local_path on the search result (most reliable — CourtListener's own copy)
         local = item.get("local_path") or item.get("localPath") or ""
