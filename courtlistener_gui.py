@@ -51,11 +51,12 @@ def _save_token(token: str) -> None:
         pass  # Non-fatal – token simply won't persist
 
 
-# LOC tile server hosts per-opinion PDFs for US Reports volumes 1-570 (~through 2012).
-# GovInfo link service covers volumes up to ~585 (~through 2017) and redirects to the
-# official opinion PDF.  Volumes 586+ fall back to the CourtListener copy.
-_LOC_MAX_VOL = 570
-_GOVINFO_MAX_VOL = 585
+# Routing logic mirrors https://github.com/birds-inc/scotuslink:
+#   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit zero-padded)
+#   vols 543+   → supremecourt.gov bound-volume PDFs with #page= anchor
+# The #page= anchor for SCOTUS bound volumes uses the US Reports page number as a
+# best-effort approximation (PDF page numbers differ slightly due to front matter).
+_LOC_CUTOFF = 542
 _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
 
@@ -63,23 +64,19 @@ def _us_reports_pdf_url(citation: str) -> Optional[str]:
     """
     Return the official US Reports PDF URL for a citation like '410 U.S. 113'.
 
-    Priority:
-        vols 1-570   → LOC tile server (per-opinion PDF, exact document)
-        vols 571-585 → GovInfo link service (redirects to per-opinion PDF)
-        vols 586+    → None  (fall back to CourtListener copy)
+        vols 1-542  → cdn.loc.gov per-opinion PDF (exact document)
+        vols 543+   → supremecourt.gov bound-volume PDF with #page anchor
     """
     m = _US_CITE_RE.search(citation)
     if not m:
         return None
     vol, page = int(m.group(1)), int(m.group(2))
-    if vol <= _LOC_MAX_VOL:
+    if vol <= _LOC_CUTOFF:
         return (
-            f"https://tile.loc.gov/storage-services/service/ll/usrep/"
-            f"usrep{vol:03d}/usrep{vol:03d}{page}/usrep{vol:03d}{page}.pdf"
+            f"https://cdn.loc.gov/service/ll/usrep/"
+            f"usrep{vol:03d}/usrep{vol:03d}{page:03d}/usrep{vol:03d}{page:03d}.pdf"
         )
-    if vol <= _GOVINFO_MAX_VOL:
-        return f"https://www.govinfo.gov/link/usreports/{vol}/{page}"
-    return None
+    return f"https://www.supremecourt.gov/opinions/boundvolumes/{vol}BV.pdf#page={page:03d}"
 
 
 try:
