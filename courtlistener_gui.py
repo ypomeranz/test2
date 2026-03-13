@@ -51,21 +51,21 @@ def _save_token(token: str) -> None:
         pass  # Non-fatal – token simply won't persist
 
 
-# Routing logic mirrors https://github.com/birds-inc/scotuslink:
+# URL routing for official US Reports PDFs:
 #   vols 1-542  → LOC CDN per-opinion PDFs (volume and page both 3-digit zero-padded)
-#   vols 543+   → supremecourt.gov bound-volume PDFs with #page= anchor
-# The #page= anchor for SCOTUS bound volumes uses the US Reports page number as a
-# best-effort approximation (PDF page numbers differ slightly due to front matter).
+#   vols 543+   → GovInfo link service (redirects to per-opinion PDF)
+#                 with supremecourt.gov bound-volume PDF as fallback if GovInfo
+#                 returns HTML instead of a PDF.
 _LOC_CUTOFF = 542
 _US_CITE_RE = re.compile(r"(\d+)\s+U\.S\.\s+(\d+)")
 
 
 def _us_reports_pdf_url(citation: str) -> Optional[str]:
     """
-    Return the official US Reports PDF URL for a citation like '410 U.S. 113'.
+    Return the primary official US Reports PDF URL for a citation like '410 U.S. 113'.
 
         vols 1-542  → cdn.loc.gov per-opinion PDF (exact document)
-        vols 543+   → supremecourt.gov bound-volume PDF with #page anchor
+        vols 543+   → govinfo.gov link service (follows redirect to per-opinion PDF)
     """
     m = _US_CITE_RE.search(citation)
     if not m:
@@ -76,6 +76,20 @@ def _us_reports_pdf_url(citation: str) -> Optional[str]:
             f"https://cdn.loc.gov/service/ll/usrep/"
             f"usrep{vol:03d}/usrep{vol:03d}{page:03d}/usrep{vol:03d}{page:03d}.pdf"
         )
+    return f"https://www.govinfo.gov/link/usreports/{vol}/{page}"
+
+
+def _us_reports_fallback_url(citation: str) -> Optional[str]:
+    """
+    Fallback URL for vols 543+ when GovInfo doesn't serve a direct PDF.
+    Uses supremecourt.gov bound-volume PDF with a best-effort #page anchor.
+    """
+    m = _US_CITE_RE.search(citation)
+    if not m:
+        return None
+    vol, page = int(m.group(1)), int(m.group(2))
+    if vol <= _LOC_CUTOFF:
+        return None  # LOC primary never needs a fallback
     return f"https://www.supremecourt.gov/opinions/boundvolumes/{vol}BV.pdf#page={page:03d}"
 
 
@@ -405,8 +419,25 @@ class CourtListenerGUI:
                 self.root.after(0, self._status_var.set, f"Downloading… {pdf_url}")
                 print(f"[download] fetching {pdf_url}")
                 response = client._session.get(pdf_url, timeout=60, stream=True)
-                print(f"[download] HTTP {response.status_code}  content-type: {response.headers.get('content-type')}")
+                ct = response.headers.get("content-type", "")
+                print(f"[download] HTTP {response.status_code}  content-type: {ct}")
                 response.raise_for_status()
+
+                # GovInfo's link service sometimes redirects to an HTML viewer
+                # rather than a direct PDF.  If that happens, fall back to the
+                # supremecourt.gov bound-volume PDF.
+                if "html" in ct:
+                    citations = item.get("citation", [])
+                    us_cite = next(
+                        (c for c in citations if " U.S. " in c), None
+                    ) if isinstance(citations, list) else None
+                    fallback = _us_reports_fallback_url(us_cite) if us_cite else None
+                    if fallback:
+                        print(f"[download] GovInfo returned HTML; retrying with {fallback}")
+                        self.root.after(0, self._status_var.set, f"Downloading… {fallback}")
+                        response = client._session.get(fallback, timeout=60, stream=True)
+                        print(f"[download] fallback HTTP {response.status_code}  content-type: {response.headers.get('content-type')}")
+                        response.raise_for_status()
 
                 with open(save_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=8192):
