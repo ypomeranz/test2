@@ -388,25 +388,44 @@ class CourtListenerGUI:
         if url:
             return url
 
-        # 3. Fetch cluster → sub_opinions → opinion detail
+        # 3. Fetch the opinion directly by its ID (search results return opinion-level
+        #    rows where 'id' is the opinion ID and 'cluster_id' is the cluster).
+        opinion_id = item.get("id")
+        if opinion_id:
+            try:
+                print(f"[resolve] fetching opinion {opinion_id} directly")
+                op = client.get_opinion(int(opinion_id))
+                print(f"[resolve] opinion keys: {list(op.keys())}")
+                print(f"[resolve] opinion local_path = {op.get('local_path')!r}")
+                print(f"[resolve] opinion download_url = {op.get('download_url')!r}")
+                local = op.get("local_path") or ""
+                if local:
+                    return storage_base + local.lstrip("/")
+                dl = op.get("download_url") or ""
+                if dl:
+                    return dl
+            except Exception as exc:
+                print(f"[resolve] direct opinion fetch failed: {exc}")
+
+        # 4. Fall back to cluster → sub_opinions walk
         cluster_id = item.get("cluster_id") or item.get("id")
         if cluster_id:
             try:
-                cluster = client.get_cluster(
-                    int(cluster_id), fields="sub_opinions"
-                )
+                print(f"[resolve] fetching cluster {cluster_id}")
+                cluster = client.get_cluster(int(cluster_id), fields="sub_opinions")
+                print(f"[resolve] sub_opinions = {cluster.get('sub_opinions')!r}")
                 for op_url in cluster.get("sub_opinions", []):
-                    op = client._get_url(
-                        op_url, {"fields": "download_url,local_path"}
-                    )
+                    print(f"[resolve] fetching sub-opinion {op_url}")
+                    op = client._get_url(op_url, {"fields": "download_url,local_path"})
+                    print(f"[resolve]   local_path={op.get('local_path')!r}  download_url={op.get('download_url')!r}")
                     local = op.get("local_path") or ""
                     if local:
                         return storage_base + local.lstrip("/")
                     dl = op.get("download_url") or ""
                     if dl:
                         return dl
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[resolve] cluster walk failed: {exc}")
 
         return None
 
