@@ -105,13 +105,18 @@ class CourtListenerGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title("CourtListener Case Law Search")
-        self.root.geometry("1050x680")
-        self.root.minsize(800, 500)
+        self.root.geometry("1300x720")
+        self.root.minsize(900, 500)
 
         self._client: Optional[CourtListenerClient] = None
         self._results: list[dict] = []
         self._search_thread: Optional[threading.Thread] = None
         self._scholar: Optional["GoogleScholarFetcher"] = None
+
+        # Preview / text-fetch state
+        self._preview_cache: dict[int, str] = {}   # result index → plain text
+        self._fetch_gen: int = 0                    # incremented on each search
+        self._fetch_sema = threading.Semaphore(4)   # cap concurrent API fetches
 
         self._build_ui()
 
@@ -190,33 +195,86 @@ class CourtListenerGUI:
             row2, from_=5, to=20, textvariable=self._page_size_var, width=5
         ).pack(side="left", padx=4)
 
-        # --- Results table ---
+        # --- Results area: left trees + right preview ---
         results_frame = ttk.LabelFrame(self.root, text="Results", padding=6)
         results_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
+        paned = ttk.PanedWindow(results_frame, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        # -- Left pane: main results tree + orders tree --
+        left_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=3)
+
         cols = ("case_name", "court", "date_filed", "citation", "status")
+
+        main_tree_frame = ttk.Frame(left_frame)
+        main_tree_frame.pack(fill="both", expand=True)
         self._tree = ttk.Treeview(
-            results_frame, columns=cols, show="headings", selectmode="browse"
+            main_tree_frame, columns=cols, show="headings", selectmode="browse"
         )
-        self._tree.heading("case_name", text="Case Name")
-        self._tree.heading("court", text="Court")
-        self._tree.heading("date_filed", text="Date Filed")
-        self._tree.heading("citation", text="Citation")
-        self._tree.heading("status", text="Status")
-
-        self._tree.column("case_name", width=390, minwidth=200)
-        self._tree.column("court", width=75, minwidth=60, anchor="center")
-        self._tree.column("date_filed", width=90, minwidth=80, anchor="center")
-        self._tree.column("citation", width=160, minwidth=100)
-        self._tree.column("status", width=120, minwidth=80)
-
-        vsb = ttk.Scrollbar(results_frame, orient="vertical", command=self._tree.yview)
+        self._configure_tree_columns(self._tree)
+        vsb = ttk.Scrollbar(main_tree_frame, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
-
         self._tree.bind("<Double-1>", lambda _e: self._download_selected())
-        self._tree.bind("<<TreeviewSelect>>", self._on_row_select)
+        self._tree.bind("<<TreeviewSelect>>", lambda _e: self._on_row_select(self._tree))
+
+        # Orders / short-opinion section
+        orders_sep = ttk.Frame(left_frame)
+        orders_sep.pack(fill="x", pady=(4, 0))
+        ttk.Separator(orders_sep, orient="horizontal").pack(fill="x")
+        ttk.Label(
+            orders_sep,
+            text="Short opinions / Orders  (< 100 words)",
+            foreground="gray",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(anchor="w", pady=(2, 0))
+
+        orders_tree_frame = ttk.Frame(left_frame)
+        orders_tree_frame.pack(fill="x")
+        self._orders_tree = ttk.Treeview(
+            orders_tree_frame, columns=cols, show="headings", selectmode="browse", height=4
+        )
+        self._configure_tree_columns(self._orders_tree)
+        vsb2 = ttk.Scrollbar(orders_tree_frame, orient="vertical", command=self._orders_tree.yview)
+        self._orders_tree.configure(yscrollcommand=vsb2.set)
+        self._orders_tree.pack(side="left", fill="x", expand=True)
+        vsb2.pack(side="right", fill="y")
+        self._orders_tree.bind("<Double-1>", lambda _e: self._download_selected())
+        self._orders_tree.bind(
+            "<<TreeviewSelect>>", lambda _e: self._on_row_select(self._orders_tree)
+        )
+
+        # -- Right pane: preview panel --
+        right_frame = ttk.LabelFrame(paned, text="Preview", padding=4)
+        paned.add(right_frame, weight=1)
+
+        self._preview_word_count_var = tk.StringVar(value="")
+        ttk.Label(
+            right_frame,
+            textvariable=self._preview_word_count_var,
+            foreground="gray",
+            font=("TkDefaultFont", 8),
+        ).pack(anchor="w")
+
+        preview_inner = ttk.Frame(right_frame)
+        preview_inner.pack(fill="both", expand=True)
+        self._preview_text = tk.Text(
+            preview_inner,
+            wrap="word",
+            state="disabled",
+            font=("TkDefaultFont", 9),
+            relief="flat",
+            background="#f5f5f5",
+        )
+        preview_vsb = ttk.Scrollbar(
+            preview_inner, orient="vertical", command=self._preview_text.yview
+        )
+        self._preview_text.configure(yscrollcommand=preview_vsb.set)
+        preview_vsb.pack(side="right", fill="y")
+        self._preview_text.pack(side="left", fill="both", expand=True)
 
         # --- Status bar + download button ---
         bottom = ttk.Frame(self.root)
@@ -248,13 +306,45 @@ class CourtListenerGUI:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _configure_tree_columns(self, tree: ttk.Treeview) -> None:
+        tree.heading("case_name", text="Case Name")
+        tree.heading("court", text="Court")
+        tree.heading("date_filed", text="Date Filed")
+        tree.heading("citation", text="Citation")
+        tree.heading("status", text="Status")
+        tree.column("case_name", width=310, minwidth=150)
+        tree.column("court", width=70, minwidth=50, anchor="center")
+        tree.column("date_filed", width=85, minwidth=70, anchor="center")
+        tree.column("citation", width=140, minwidth=80)
+        tree.column("status", width=110, minwidth=70)
+
+    def _iid_to_idx(self, iid: str) -> int:
+        """Convert a tree row iid to an index into self._results."""
+        return int(iid[1:]) if iid.startswith("s") else int(iid)
+
+    def _get_selected_item(self) -> Optional[tuple[int, dict]]:
+        """Return (index, result-dict) for whichever tree has a selection."""
+        for tree in (self._tree, self._orders_tree):
+            sel = tree.selection()
+            if sel:
+                idx = self._iid_to_idx(sel[0])
+                return idx, self._results[idx]
+        return None
+
     def _toggle_token_vis(self) -> None:
         self._token_entry.config(show="" if self._show_token_var.get() else "*")
 
-    def _on_row_select(self, _event=None) -> None:
-        if self._tree.selection():
-            self._download_btn.config(state="normal")
-            self._scholar_btn.config(state="normal")
+    def _on_row_select(self, source_tree: ttk.Treeview) -> None:
+        sel = source_tree.selection()
+        if not sel:
+            return
+        # Deselect the other tree so only one row is ever active
+        other = self._orders_tree if source_tree is self._tree else self._tree
+        if other.selection():
+            other.selection_remove(*other.selection())
+        self._download_btn.config(state="normal")
+        self._scholar_btn.config(state="normal")
+        self._show_preview(self._iid_to_idx(sel[0]))
 
     def _get_client(self) -> Optional[CourtListenerClient]:
         token = self._token_var.get().strip()
@@ -301,7 +391,16 @@ class CourtListenerGUI:
         self._status_var.set("Searching…")
         for row in self._tree.get_children():
             self._tree.delete(row)
+        for row in self._orders_tree.get_children():
+            self._orders_tree.delete(row)
         self._results.clear()
+        # Invalidate any in-flight preview fetches from the previous search
+        self._fetch_gen += 1
+        self._preview_cache.clear()
+        self._preview_word_count_var.set("")
+        self._preview_text.config(state="normal")
+        self._preview_text.delete("1.0", "end")
+        self._preview_text.config(state="disabled")
 
         def run() -> None:
             try:
@@ -356,6 +455,82 @@ class CourtListenerGUI:
         else:
             self._status_var.set("No results found.")
 
+        # Kick off background text fetches (word-count + preview)
+        client = self._client
+        gen = self._fetch_gen
+        if client:
+            for i, item in enumerate(results):
+                opinion_id = item.get("id")
+                if opinion_id:
+                    threading.Thread(
+                        target=self._fetch_preview,
+                        args=(i, int(opinion_id), client, gen),
+                        daemon=True,
+                    ).start()
+
+    def _fetch_preview(
+        self,
+        idx: int,
+        opinion_id: int,
+        client: CourtListenerClient,
+        gen: int,
+    ) -> None:
+        """Background thread: fetch plain text, compute word count, schedule UI update."""
+        with self._fetch_sema:
+            if gen != self._fetch_gen:
+                return
+            try:
+                op = client.get_opinion(opinion_id, fields="plain_text")
+                text = op.get("plain_text") or ""
+                text = re.sub(r"<[^>]+>", "", text).strip()
+            except Exception:
+                text = ""
+            if gen != self._fetch_gen:
+                return
+            word_count = len(text.split()) if text else 0
+            self.root.after(0, self._on_preview_ready, idx, text, word_count, gen)
+
+    def _on_preview_ready(
+        self, idx: int, text: str, word_count: int, gen: int
+    ) -> None:
+        """Main-thread callback: store preview text and move short opinions to orders tree."""
+        if gen != self._fetch_gen:
+            return
+        self._preview_cache[idx] = text
+
+        # Refresh preview panel if this is the currently selected row
+        sel = self._tree.selection() or self._orders_tree.selection()
+        if sel and self._iid_to_idx(sel[0]) == idx:
+            self._show_preview(idx)
+
+        # Move short opinions to the orders tree
+        if word_count < 100 and text:
+            iid = str(idx)
+            if self._tree.exists(iid):
+                vals = self._tree.item(iid, "values")
+                self._tree.delete(iid)
+                self._orders_tree.insert("", "end", iid=f"s{idx}", values=vals)
+
+    def _show_preview(self, idx: int) -> None:
+        """Populate the right-hand preview panel for result at *idx*."""
+        self._preview_text.config(state="normal")
+        self._preview_text.delete("1.0", "end")
+        if idx in self._preview_cache:
+            text = self._preview_cache[idx]
+            if text:
+                word_count = len(text.split())
+                self._preview_word_count_var.set(f"{word_count:,} words")
+                self._preview_text.insert("1.0", text[:2000])
+            else:
+                self._preview_word_count_var.set("")
+                self._preview_text.insert(
+                    "1.0", "(No text available — download PDF for full opinion)"
+                )
+        else:
+            self._preview_word_count_var.set("")
+            self._preview_text.insert("1.0", "Loading preview…")
+        self._preview_text.config(state="disabled")
+
     def _on_error(self, message: str) -> None:
         self._search_btn.config(state="normal")
         self._status_var.set(f"Error: {message}")
@@ -366,13 +541,12 @@ class CourtListenerGUI:
     # ------------------------------------------------------------------
 
     def _download_selected(self) -> None:
-        selection = self._tree.selection()
-        if not selection:
+        selected = self._get_selected_item()
+        if not selected:
             messagebox.showinfo("No Selection", "Please select a case first.")
             return
 
-        idx = int(selection[0])
-        item = self._results[idx]
+        idx, item = selected
 
         case_name = item.get("caseName") or item.get("case_name") or "opinion"
         safe_name = "".join(
@@ -547,8 +721,8 @@ class CourtListenerGUI:
         return self._scholar
 
     def _fetch_scholar_text(self) -> None:
-        selection = self._tree.selection()
-        if not selection:
+        selected = self._get_selected_item()
+        if not selected:
             messagebox.showinfo("No Selection", "Please select a case first.")
             return
 
@@ -556,8 +730,7 @@ class CourtListenerGUI:
         if fetcher is None:
             return
 
-        idx = int(selection[0])
-        item = self._results[idx]
+        _, item = selected
 
         citations = item.get("citation", [])
         citation_str = citations[0] if isinstance(citations, list) and citations else ""
